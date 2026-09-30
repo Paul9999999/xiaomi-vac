@@ -55,6 +55,8 @@ class XiaomiCloud:
         self._fields: dict = {}
         self._2fa_ctx: str | None = None
         self._lp_url: str | None = None
+        # per-region outcome of the last list_vacuums() call
+        self.discovery_record: list[dict] = []
 
     # --- QR login -------------------------------------------------------
     def qr_begin(self) -> tuple[bytes, str]:
@@ -126,21 +128,36 @@ class XiaomiCloud:
         filtering (supported vs. unsupported) is left to the caller.
         """
         found: dict[str, dict] = {}  # keyed by did to dedupe across servers
+        self.discovery_record = []
         for srv in SERVERS:
             resp = self._call(self._api_url(srv) + "/home/device_list",
                               {"data": '{"getVirtualModel":false,"getHuamiDevices":0}'})
             if not resp:
+                self.discovery_record.append(
+                    {"region": srv, "answered": False, "devices": 0, "vacuums": 0})
                 continue
-            for d in resp.get("result", {}).get("list", []):
+            devices = resp.get("result", {}).get("list", [])
+            vacuums = 0
+            for d in devices:
                 model = d.get("model", "")
                 did = d.get("did")
-                if did in found or ".vacuum." not in model:
+                if ".vacuum." not in model:
+                    continue
+                vacuums += 1
+                if did in found:
                     continue
                 found[did] = {
                     "name": d.get("name"), "did": did, "model": model,
                     "mac": d.get("mac", ""), "localip": d.get("localip", ""),
                     "token": d.get("token", ""), "server": srv,
                 }
+            self.discovery_record.append(
+                {"region": srv, "answered": True, "devices": len(devices), "vacuums": vacuums})
+        for rec in self.discovery_record:
+            _LOGGER.debug(
+                "Discovery region=%s answered=%s devices=%d vacuums=%d",
+                rec["region"], rec["answered"], rec["devices"], rec["vacuums"],
+            )
         return list(found.values())
 
     def restore_session(self, user_id, ssecurity, service_token, pass_token=None) -> None:
