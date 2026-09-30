@@ -17,6 +17,7 @@ from vacuum_map_parser_ijai.map_data_parser import IjaiMapDataParser
 
 from . import map_vector
 from .cloud.connector import XiaomiCloud
+from .map_diagnostics import SlotAttempt
 from .map_parsers import (
     dreame_decrypt_cloud_blob,
     dreame_extract_enckey,
@@ -154,6 +155,8 @@ class MapFetcher:
         # unencrypted models or until the property is successfully read.
         self._enckey: str | None = None
         self._enckey_polled = False
+        # What the most recent fetch() call did; overwritten by every call.
+        self.last_attempt: SlotAttempt | None = None
 
     def _get_dreame_enckey(self) -> str | None:
         """Poll siid=6/piid=3 for the dreame cloud map encryption key."""
@@ -207,13 +210,18 @@ class MapFetcher:
             self._enckey_polled = True
             _LOGGER.debug("dreame enckey poll: %s",
                           "found" if self._enckey else "not found (unencrypted or unavailable)")
+        attempt = self.last_attempt = SlotAttempt(slot=slot)
         url = self._cloud.map_url(self._server, self._device_id, slot, self._endpoint)
+        attempt.url_obtained = bool(url)
         if not url:
             # No URL usually means the cloud session expired; let the
             # coordinator try a token refresh.
+            attempt.outcome = "no_url"
             raise SessionExpired()
         raw = self._cloud.download(url)
+        attempt.blob_bytes = len(raw) if raw else 0
         if not raw:
+            attempt.outcome = "empty_download"
             # Not per-slot actionable; the coordinator raises UpdateFailed when
             # every fallback (both slots + cache) comes up empty.
             _LOGGER.debug("Map download failed (slot %s)", slot)
@@ -232,6 +240,7 @@ class MapFetcher:
                 self._enckey = None
                 self._enckey_polled = False
             _LOGGER.debug("Could not decrypt map at slot %s: %s", slot, ex)
+            attempt.outcome = "undecryptable"
             return None
         carpets = parse_carpets(unpacked) if self._brand == "xiaomi" else []
         path_segments = parse_path(unpacked) if self._brand == "xiaomi" else []
@@ -248,9 +257,11 @@ class MapFetcher:
             # Decrypted fine but the parser rejected the frame (corrupt or
             # unexpected layout). The key material is good — keep the enckey.
             _LOGGER.debug("Parser rejected map frame at slot %s: %s", slot, ex)
+            attempt.outcome = "parse_rejected"
             return None
         if md.image is None or md.image.is_empty:
             _LOGGER.debug("Parsed map at slot %s is empty", slot)
+            attempt.outcome = "empty_render"
             return None
 
         cropped, off_x, off_y = _autocrop(md.image.data)
@@ -281,6 +292,7 @@ class MapFetcher:
             "image_width": cropped.width,
             "image_height": cropped.height,
         }
+        attempt.outcome = "rendered"
         return MapResult(
             image_png=buf.getvalue(),
             attributes=attributes,

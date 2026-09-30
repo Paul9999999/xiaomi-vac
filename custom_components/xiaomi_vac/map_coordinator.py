@@ -33,6 +33,7 @@ from .coordinator import XiaomiVacuumCoordinator
 from .device import IjaiVacuumDevice
 from .map import MapFetcher, MapResult, SessionExpired
 from .map_cache import MapCache
+from .map_diagnostics import MapCycleRecord, describe_map_capability, resolve_active_id
 from .map_parsers import parser_key, required_map_key_inputs
 from .spec.types import MapCapability
 
@@ -112,6 +113,8 @@ class XiaomiMapCoordinator(DataUpdateCoordinator[MapResult]):
         self._last_live_at: float | None = None
         self._refresh_map_lock = asyncio.Lock()
         self._pending_entry_updates: dict[str, str] = {}
+        # What the most recent cycle did; replaced at the start of every cycle.
+        self.last_cycle: MapCycleRecord | None = None
 
     @property
     def device(self) -> IjaiVacuumDevice:
@@ -377,6 +380,7 @@ class XiaomiMapCoordinator(DataUpdateCoordinator[MapResult]):
         coordinator's refresh/reauth handling wants.
         """
         results: list[MapResult | None] = []
+        attempts = []
         any_resolved = False
         for slot in _SLOTS:
             try:
@@ -384,13 +388,15 @@ class XiaomiMapCoordinator(DataUpdateCoordinator[MapResult]):
                 any_resolved = True
             except SessionExpired:
                 results.append(None)
+            attempts.append(self._fetcher.last_attempt)
+        self.last_cycle.slots = attempts
         if not any_resolved:
             raise SessionExpired()
         return results
 
     def _resolve_active_id(
         self, active_meta: dict | None, decoded: list[MapResult], maps_meta: list[dict],
-    ) -> int | None:
+    ) -> tuple[int | None, str | None]:
         """Which map this cycle's data belongs to, in order of trust:
 
         1. A live blob's own embedded id (ground truth from the cloud blob
@@ -400,20 +406,10 @@ class XiaomiMapCoordinator(DataUpdateCoordinator[MapResult]):
            capability at all — an empty `maps_meta` from a transient read
            failure on a multi-map device must NOT be mistaken for that.
         """
-        for r in decoded:
-            if r.map_id is not None:
-                return r.map_id
-        if active_meta and active_meta.get("id") is not None:
-            try:
-                return int(active_meta["id"])
-            except (TypeError, ValueError):
-                pass
-        # Use the MQTT-signaled id when map-list read failed this cycle.
-        if self._mqtt_active_id is not None:
-            return self._mqtt_active_id
-        if not self._has_map_list and not maps_meta:
-            return _SINGLE_MAP_ID
-        return None
+        return resolve_active_id(
+            decoded, active_meta, self._mqtt_active_id, self._has_map_list,
+            maps_meta, single_map_id=_SINGLE_MAP_ID,
+        )
 
     def _serve(
         self, cache: MapCache, active_id: int | None, maps_meta: list[dict],
@@ -451,6 +447,10 @@ class XiaomiMapCoordinator(DataUpdateCoordinator[MapResult]):
 
     async def _async_update_data(self) -> MapResult:
         self._tune_interval()
+        self.last_cycle = MapCycleRecord(
+            parser_key=parser_key(self._device.profile),
+            map_capability=describe_map_capability(self._device.profile.map),
+        )
         try:
             if self._fetcher is None:
                 self._fetcher = await self.hass.async_add_executor_job(self._build)
@@ -494,7 +494,10 @@ class XiaomiMapCoordinator(DataUpdateCoordinator[MapResult]):
 
             decoded = [r for r in slot_results if r is not None]
             active_meta = next((m for m in maps_meta if m.get("cur")), None)
-            active_id = self._resolve_active_id(active_meta, decoded, maps_meta)
+            active_id, self.last_cycle.resolved_by = self._resolve_active_id(
+                active_meta, decoded, maps_meta,
+            )
+            self.last_cycle.resolved_map_id = active_id
             _LOGGER.debug(
                 "Map cycle: slot keys=%s active_id=%s maps_listed=%d",
                 ["A" if r is not None else "B" for r in slot_results],
@@ -525,6 +528,7 @@ class XiaomiMapCoordinator(DataUpdateCoordinator[MapResult]):
                     await cache.async_prune(keep_ids)
 
             result = self._serve(cache, active_id, maps_meta)
+            self.last_cycle.set_served(decoded=bool(decoded), have_result=result is not None)
             if result is None:
                 # Nothing live AND nothing cached for this map id yet. This is
                 # the normal cold-start state: the vacuum's current upload is a
